@@ -7,8 +7,9 @@ The first release supports:
 - image resizing, JPEG/PNG/WebP/AVIF conversion, quality control, rotation, and metadata removal;
 - video trimming, resizing, MP4/WebM conversion, compression, rotation, and audio removal;
 - drag-and-drop, native file and output-folder pickers, folder import, batches up to 1,000 files, and per-file results;
-- reusable built-in and custom presets;
-- before/after image previews and conservative size estimates;
+- reusable built-in and custom presets with validated JSON import and export;
+- genuinely rendered before/after image and video-frame previews, plus conservative size estimates;
+- live per-video encoding progress from FFmpeg;
 - cancellation, temporary-output cleanup, free-space checking, collision-safe names, and local job history; and
 - a browser-safe demo adapter for interface development.
 

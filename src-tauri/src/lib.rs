@@ -2,9 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
+    sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc, Mutex},
     thread,
     time::Duration,
 };
@@ -60,6 +61,7 @@ struct JobProgress {
     total: usize,
     path: String,
     status: String,
+    file_progress: Option<f32>,
     output_path: Option<String>,
     output_size: Option<u64>,
     error: Option<String>,
@@ -73,6 +75,38 @@ struct ProcessSummary { completed: usize, failed: usize }
 
 #[derive(Serialize)]
 struct PreviewData { bytes: Vec<u8>, mime: String }
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PresetPayload {
+    #[serde(default)]
+    id: String,
+    name: String,
+    description: String,
+    operations: Vec<Operation>,
+    #[serde(default)]
+    builtin: bool,
+}
+
+fn validate_operations(operations: &[Operation]) -> Result<(), String> {
+    let enabled: Vec<_> = operations.iter().filter(|operation| operation.enabled).collect();
+    if enabled.is_empty() { return Err("Enable at least one processing step".into()); }
+    if enabled.len() > 20 { return Err("A recipe can contain at most 20 enabled steps".into()); }
+    if enabled.iter().filter(|operation| operation.kind == "format").count() > 1 { return Err("Use only one output-format step".into()); }
+    for operation in enabled {
+        match operation.kind.as_str() {
+            "resize" if !matches!((operation.width, operation.height), (Some(1..=16_384), Some(1..=16_384))) => return Err("Resize dimensions must be between 1 and 16,384 pixels".into()),
+            "resize" if !matches!(operation.fit.as_deref(), Some("contain" | "cover" | "exact")) => return Err("Resize fit must be contain, cover, or exact".into()),
+            "quality" if !matches!(operation.quality, Some(1..=100)) => return Err("Quality must be between 1 and 100".into()),
+            "trim" if operation.start.unwrap_or(0.0) < 0.0 || operation.end.is_none() || operation.end.unwrap_or(0.0) <= operation.start.unwrap_or(0.0) => return Err("Trim must end after its non-negative start time".into()),
+            "rotate" if !matches!(operation.degrees, Some(90 | 180 | 270)) => return Err("Rotation must be 90, 180, or 270 degrees".into()),
+            "format" if !matches!(operation.format.as_deref(), Some("original" | "jpg" | "png" | "webp" | "avif" | "mp4" | "webm")) => return Err("The requested output format is unsupported".into()),
+            "resize" | "format" | "quality" | "stripMetadata" | "trim" | "removeAudio" | "rotate" => {}
+            _ => return Err(format!("Unsupported operation: {}", operation.kind)),
+        }
+    }
+    Ok(())
+}
 
 fn command_exists(name: &str) -> bool {
     Command::new(name).arg("-version").stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
@@ -152,6 +186,65 @@ fn read_preview(path: String) -> Result<PreviewData, String> {
     Ok(PreviewData { bytes: fs::read(canonical).map_err(|e| e.to_string())?, mime: mime.into() })
 }
 
+fn append_image_operations(command: &mut Command, operations: &[Operation]) {
+    for operation in operations.iter().filter(|operation| operation.enabled) {
+        match operation.kind.as_str() {
+            "resize" => {
+                let (width, height) = (operation.width.unwrap_or(2048), operation.height.unwrap_or(2048));
+                match operation.fit.as_deref() {
+                    Some("cover") => { command.args(["-resize", &format!("{width}x{height}^"), "-gravity", "center", "-extent", &format!("{width}x{height}")]); }
+                    Some("exact") => { command.args(["-resize", &format!("{width}x{height}!")]); }
+                    _ => { command.args(["-resize", &format!("{width}x{height}>")]); }
+                }
+            }
+            "rotate" => { command.args(["-rotate", &operation.degrees.unwrap_or(90).to_string()]); }
+            "stripMetadata" => { command.arg("-strip"); }
+            "quality" => { command.args(["-quality", &operation.quality.unwrap_or(82).to_string()]); }
+            _ => {}
+        }
+    }
+}
+
+fn video_filters(operations: &[Operation]) -> Vec<String> {
+    let mut filters = Vec::new();
+    for operation in operations.iter().filter(|operation| operation.enabled) {
+        match operation.kind.as_str() {
+            "resize" => {
+                let (width, height) = (operation.width.unwrap_or(1280), operation.height.unwrap_or(720));
+                filters.push(match operation.fit.as_deref() {
+                    Some("cover") => format!("scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height}"),
+                    Some("exact") => format!("scale={width}:{height}"),
+                    _ => format!("scale={width}:{height}:force_original_aspect_ratio=decrease"),
+                });
+            }
+            "rotate" => filters.push(match operation.degrees.unwrap_or(90) { 180 => "hflip,vflip".into(), 270 => "transpose=2".into(), _ => "transpose=1".into() }),
+            _ => {}
+        }
+    }
+    filters
+}
+
+#[tauri::command]
+fn render_preview(path: String, operations: Vec<Operation>) -> Result<PreviewData, String> {
+    if !operations.is_empty() { validate_operations(&operations)?; }
+    let canonical = fs::canonicalize(path).map_err(|e| e.to_string())?;
+    let kind = extension_kind(&canonical).ok_or("Only supported media can be previewed")?;
+    let output = if kind == "image" {
+        let mut command = Command::new("magick");
+        command.arg(&canonical).arg("-auto-orient");
+        append_image_operations(&mut command, &operations);
+        command.args(["-thumbnail", "1400x900>", "-strip", "jpeg:-"]).output().map_err(|e| format!("Could not render preview: {e}"))?
+    } else {
+        let start = format_operation(&operations, "trim").and_then(|operation| operation.start).unwrap_or(0.0);
+        let mut filters = video_filters(&operations);
+        filters.push("scale=1400:900:force_original_aspect_ratio=decrease".into());
+        Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-ss", &start.to_string(), "-i", canonical.to_string_lossy().as_ref(), "-vf", &filters.join(","), "-frames:v", "1", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]).output().map_err(|e| format!("Could not render video preview: {e}"))?
+    };
+    if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()); }
+    if output.stdout.len() > 12 * 1024 * 1024 { return Err("Rendered preview exceeded the 12 MiB limit".into()); }
+    Ok(PreviewData { bytes: output.stdout, mime: "image/jpeg".into() })
+}
+
 fn picker(args: &[&str]) -> Result<Vec<String>, String> {
     let (program, actual): (&str, Vec<&str>) = if binary_on_path("kdialog") {
         ("kdialog", args.to_vec())
@@ -169,6 +262,50 @@ fn pick_files() -> Result<Vec<String>, String> { picker(&["--getopenfilename", "
 
 #[tauri::command]
 fn pick_output_directory() -> Result<Option<String>, String> { Ok(picker(&["--getexistingdirectory", "."])?.into_iter().next()) }
+
+fn json_picker(save: bool) -> Result<Option<PathBuf>, String> {
+    let output = if binary_on_path("kdialog") {
+        let mode = if save { "--getsavefilename" } else { "--getopenfilename" };
+        Command::new("kdialog").args([mode, ".", "Forge presets (*.json)"]).output()
+    } else if binary_on_path("zenity") {
+        let mut command = Command::new("zenity"); command.arg("--file-selection");
+        if save { command.args(["--save", "--confirm-overwrite", "--filename=forge-recipe.forge.json"]); }
+        else { command.arg("--file-filter=Forge presets | *.json"); }
+        command.output()
+    } else { return Err("Install kdialog or zenity to choose preset files".into()); };
+    let output = output.map_err(|e| format!("Could not open the preset picker: {e}"))?;
+    if !output.status.success() { return Ok(None); }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok((!value.is_empty()).then(|| PathBuf::from(value)))
+}
+
+fn validate_preset(preset: &PresetPayload) -> Result<(), String> {
+    if preset.name.trim().is_empty() || preset.name.chars().count() > 80 { return Err("Preset names must contain 1–80 characters".into()); }
+    if preset.description.chars().count() > 240 { return Err("Preset descriptions can contain at most 240 characters".into()); }
+    validate_operations(&preset.operations)
+}
+
+#[tauri::command]
+fn export_preset(mut preset: PresetPayload) -> Result<bool, String> {
+    validate_preset(&preset)?;
+    let Some(mut path) = json_picker(true)? else { return Ok(false); };
+    if path.extension().and_then(|value| value.to_str()) != Some("json") { path.set_extension("forge.json"); }
+    preset.builtin = false;
+    let bytes = serde_json::to_vec_pretty(&preset).map_err(|e| e.to_string())?;
+    fs::write(path, bytes).map_err(|e| format!("Could not export preset: {e}"))?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn import_preset() -> Result<Option<PresetPayload>, String> {
+    let Some(path) = json_picker(false)? else { return Ok(None); };
+    let metadata = fs::metadata(&path).map_err(|e| format!("Could not read preset: {e}"))?;
+    if metadata.len() > 1024 * 1024 { return Err("Preset files cannot exceed 1 MiB".into()); }
+    let mut preset: PresetPayload = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?).map_err(|e| format!("Invalid Forge preset: {e}"))?;
+    validate_preset(&preset)?;
+    preset.builtin = false;
+    Ok(Some(preset))
+}
 
 fn data_file() -> Result<PathBuf, String> {
     let directory = dirs::data_local_dir().ok_or("The application data directory is unavailable")?.join("forge");
@@ -227,25 +364,36 @@ fn wait_for_child(child: &mut Child, cancelled: &AtomicBool) -> Result<(), Strin
     }
 }
 
+fn wait_for_ffmpeg(child: &mut Child, cancelled: &AtomicBool, duration: f64, mut progress: impl FnMut(f32)) -> Result<(), String> {
+    let stdout = child.stdout.take().ok_or("FFmpeg progress output is unavailable")?;
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) { let _ = sender.send(line); }
+    });
+    let mut last = 0.0_f32;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            let _ = child.kill(); let _ = child.wait();
+            return Err("Job cancelled".into());
+        }
+        while let Ok(line) = receiver.try_recv() {
+            if let Some(value) = line.strip_prefix("out_time_us=").and_then(|value| value.parse::<f64>().ok()) {
+                let current = (value / 1_000_000.0 / duration.max(0.01)).clamp(0.0, 0.99) as f32;
+                if current - last >= 0.01 { last = current; progress(current); }
+            }
+        }
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) if status.success() => { progress(1.0); return Ok(()); }
+            Some(status) => return Err(format!("FFmpeg exited with {status}")),
+            None => thread::sleep(Duration::from_millis(120)),
+        }
+    }
+}
+
 fn process_image(input: &Path, temporary: &Path, operations: &[Operation], cancelled: &AtomicBool) -> Result<(), String> {
     let mut command = Command::new("magick");
     command.arg(input).arg("-auto-orient");
-    for operation in operations.iter().filter(|op| op.enabled) {
-        match operation.kind.as_str() {
-            "resize" => {
-                let (width, height) = (operation.width.unwrap_or(2048).max(1), operation.height.unwrap_or(2048).max(1));
-                match operation.fit.as_deref() {
-                    Some("cover") => { command.args(["-resize", &format!("{width}x{height}^"), "-gravity", "center", "-extent", &format!("{width}x{height}")]); },
-                    Some("exact") => { command.args(["-resize", &format!("{width}x{height}!")]); },
-                    _ => { command.args(["-resize", &format!("{width}x{height}>")]); },
-                }
-            }
-            "rotate" => { command.args(["-rotate", &operation.degrees.unwrap_or(90).to_string()]); },
-            "stripMetadata" => { command.arg("-strip"); },
-            "quality" => { command.args(["-quality", &operation.quality.unwrap_or(82).clamp(1, 100).to_string()]); },
-            _ => {}
-        }
-    }
+    append_image_operations(&mut command, operations);
     command.arg(temporary).stdout(Stdio::null()).stderr(Stdio::null());
     let mut child = command.spawn().map_err(|e| format!("Could not start ImageMagick: {e}"))?;
     wait_for_child(&mut child, cancelled)?;
@@ -256,7 +404,7 @@ fn process_image(input: &Path, temporary: &Path, operations: &[Operation], cance
     Ok(())
 }
 
-fn process_video(input: &Path, temporary: &Path, extension: &str, operations: &[Operation], cancelled: &AtomicBool) -> Result<(), String> {
+fn process_video(input: &Path, temporary: &Path, extension: &str, source_duration: Option<f64>, operations: &[Operation], cancelled: &AtomicBool, progress: impl FnMut(f32)) -> Result<(), String> {
     let mut command = Command::new("ffmpeg");
     command.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]);
     if let Some(trim) = format_operation(operations, "trim") {
@@ -268,30 +416,18 @@ fn process_video(input: &Path, temporary: &Path, extension: &str, operations: &[
             if end > start { command.args(["-t", &(end - start).to_string()]); }
         }
     }
-    let mut filters = Vec::new();
-    for operation in operations.iter().filter(|op| op.enabled) {
-        match operation.kind.as_str() {
-            "resize" => {
-                let (w, h) = (operation.width.unwrap_or(1280).max(2), operation.height.unwrap_or(720).max(2));
-                filters.push(match operation.fit.as_deref() {
-                    Some("cover") => format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"),
-                    Some("exact") => format!("scale={w}:{h}"),
-                    _ => format!("scale={w}:{h}:force_original_aspect_ratio=decrease"),
-                });
-            }
-            "rotate" => filters.push(match operation.degrees.unwrap_or(90) { 180 => "hflip,vflip".into(), 270 => "transpose=2".into(), _ => "transpose=1".into() }),
-            _ => {}
-        }
-    }
+    let mut filters = video_filters(operations);
+    filters.push("scale=trunc(iw/2)*2:trunc(ih/2)*2".into());
     if !filters.is_empty() { command.args(["-vf", &filters.join(",")]); }
     let quality = format_operation(operations, "quality").and_then(|op| op.quality).unwrap_or(78).clamp(1, 100);
     let crf = (38.0 - f32::from(quality) * 0.22).round().clamp(16.0, 38.0) as u8;
     if extension == "webm" { command.args(["-c:v", "libvpx-vp9", "-crf", &crf.to_string(), "-b:v", "0", "-c:a", "libopus"]); }
     else { command.args(["-c:v", "libx264", "-preset", "medium", "-crf", &crf.to_string(), "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"]); }
     if format_operation(operations, "removeAudio").is_some() { command.arg("-an"); }
-    command.arg(temporary).stdout(Stdio::null()).stderr(Stdio::null());
+    command.args(["-progress", "pipe:1", "-nostats"]).arg(temporary).stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = command.spawn().map_err(|e| format!("Could not start FFmpeg: {e}"))?;
-    wait_for_child(&mut child, cancelled)
+    let duration = format_operation(operations, "trim").and_then(|trim| match (trim.start, trim.end) { (Some(start), Some(end)) if end > start => Some(end - start), _ => None }).or(source_duration).unwrap_or(1.0);
+    wait_for_ffmpeg(&mut child, cancelled, duration, progress)
 }
 
 fn available_bytes(path: &Path) -> Option<u64> {
@@ -314,15 +450,20 @@ fn run_job(app: AppHandle, request: ProcessRequest, cancelled: Arc<AtomicBool>) 
         let stem = input.file_stem().unwrap_or_default().to_string_lossy();
         let final_path = collision_safe_path(&output_dir, &stem, &extension);
         let temporary = output_dir.join(format!(".forge-{}-{index}.{extension}", request.job_id));
-        let _ = app.emit("job-progress", JobProgress { job_id: request.job_id.clone(), index, total, path: file.path.clone(), status: "running".into(), output_path: None, output_size: None, error: None });
-        let result = if file.kind == "image" { process_image(&input, &temporary, &request.operations, &cancelled) } else { process_video(&input, &temporary, &extension, &request.operations, &cancelled) };
+        let _ = app.emit("job-progress", JobProgress { job_id: request.job_id.clone(), index, total, path: file.path.clone(), status: "running".into(), file_progress: Some(0.0), output_path: None, output_size: None, error: None });
+        let result = if file.kind == "image" { process_image(&input, &temporary, &request.operations, &cancelled) } else {
+            let job_id = request.job_id.clone(); let source_path = file.path.clone(); let app_handle = app.clone();
+            process_video(&input, &temporary, &extension, file.duration, &request.operations, &cancelled, move |file_progress| {
+                let _ = app_handle.emit("job-progress", JobProgress { job_id: job_id.clone(), index, total, path: source_path.clone(), status: "running".into(), file_progress: Some(file_progress), output_path: None, output_size: None, error: None });
+            })
+        };
         match result {
             Ok(()) => match fs::rename(&temporary, &final_path) {
-                Ok(()) => { summary.completed += 1; let size = fs::metadata(&final_path).map(|m| m.len()).ok(); let _ = app.emit("job-progress", JobProgress { job_id: request.job_id.clone(), index, total, path: file.path.clone(), status: "completed".into(), output_path: Some(final_path.to_string_lossy().into_owned()), output_size: size, error: None }); },
-                Err(error) => { summary.failed += 1; let _ = fs::remove_file(&temporary); let message = format!("Could not finish export: {error}"); let _ = app.emit("job-progress", JobProgress { job_id: request.job_id.clone(), index, total, path: file.path.clone(), status: "failed".into(), output_path: None, output_size: None, error: Some(message) }); }
+                Ok(()) => { summary.completed += 1; let size = fs::metadata(&final_path).map(|m| m.len()).ok(); let _ = app.emit("job-progress", JobProgress { job_id: request.job_id.clone(), index, total, path: file.path.clone(), status: "completed".into(), file_progress: Some(1.0), output_path: Some(final_path.to_string_lossy().into_owned()), output_size: size, error: None }); },
+                Err(error) => { summary.failed += 1; let _ = fs::remove_file(&temporary); let message = format!("Could not finish export: {error}"); let _ = app.emit("job-progress", JobProgress { job_id: request.job_id.clone(), index, total, path: file.path.clone(), status: "failed".into(), file_progress: Some(1.0), output_path: None, output_size: None, error: Some(message) }); }
             },
-            Err(error) if error == "Job cancelled" => { let _ = fs::remove_file(&temporary); let _ = app.emit("job-progress", JobProgress { job_id: request.job_id.clone(), index, total, path: file.path.clone(), status: "cancelled".into(), output_path: None, output_size: None, error: None }); return Err(error); },
-            Err(error) => { summary.failed += 1; let _ = fs::remove_file(&temporary); let _ = app.emit("job-progress", JobProgress { job_id: request.job_id.clone(), index, total, path: file.path.clone(), status: "failed".into(), output_path: None, output_size: None, error: Some(error) }); }
+            Err(error) if error == "Job cancelled" => { let _ = fs::remove_file(&temporary); let _ = app.emit("job-progress", JobProgress { job_id: request.job_id.clone(), index, total, path: file.path.clone(), status: "cancelled".into(), file_progress: None, output_path: None, output_size: None, error: None }); return Err(error); },
+            Err(error) => { summary.failed += 1; let _ = fs::remove_file(&temporary); let _ = app.emit("job-progress", JobProgress { job_id: request.job_id.clone(), index, total, path: file.path.clone(), status: "failed".into(), file_progress: Some(1.0), output_path: None, output_size: None, error: Some(error) }); }
         }
     }
     Ok(summary)
@@ -331,6 +472,7 @@ fn run_job(app: AppHandle, request: ProcessRequest, cancelled: Arc<AtomicBool>) 
 #[tauri::command]
 async fn process_job(app: AppHandle, request: ProcessRequest, jobs: State<'_, JobRegistry>) -> Result<ProcessSummary, String> {
     if request.files.is_empty() || request.files.len() > 1_000 { return Err("A batch must contain between 1 and 1,000 files".into()); }
+    validate_operations(&request.operations)?;
     let cancelled = Arc::new(AtomicBool::new(false));
     jobs.0.lock().map_err(|_| "Job registry is unavailable")?.insert(request.job_id.clone(), cancelled.clone());
     let id = request.job_id.clone();
@@ -356,7 +498,7 @@ fn reveal_path(path: String) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(JobRegistry::default())
-        .invoke_handler(tauri::generate_handler![tool_status, inspect_paths, read_preview, pick_files, pick_output_directory, load_state, save_state, process_job, cancel_job, reveal_path])
+        .invoke_handler(tauri::generate_handler![tool_status, inspect_paths, read_preview, render_preview, pick_files, pick_output_directory, export_preset, import_preset, load_state, save_state, process_job, cancel_job, reveal_path])
         .run(tauri::generate_context!())
         .expect("error while running Forge");
 }
@@ -387,7 +529,10 @@ mod tests {
         assert!(Command::new("magick").args(["-size", "640x480", "gradient:#183126-#d39642", input.to_string_lossy().as_ref()]).status().unwrap().success());
         let mut resize = operation("resize"); resize.width = Some(320); resize.height = Some(320); resize.fit = Some("contain".into());
         let mut quality = operation("quality"); quality.quality = Some(75);
-        process_image(&input, &output, &[resize, quality, operation("stripMetadata")], &AtomicBool::new(false)).unwrap();
+        let recipe = vec![resize, quality, operation("stripMetadata")];
+        let preview = render_preview(input.to_string_lossy().into_owned(), recipe.clone()).unwrap();
+        assert!(preview.bytes.starts_with(&[0xff, 0xd8, 0xff]));
+        process_image(&input, &output, &recipe, &AtomicBool::new(false)).unwrap();
         let dimensions = Command::new("magick").args(["identify", "-format", "%wx%h", output.to_string_lossy().as_ref()]).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&dimensions.stdout), "320x240");
         fs::remove_dir_all(dir).unwrap();
@@ -399,12 +544,23 @@ mod tests {
         let input = dir.join("input.mp4"); let output = dir.join("output.mp4");
         assert!(Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=#d39642:s=640x360:d=0.25", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", input.to_string_lossy().as_ref()]).status().unwrap().success());
         let mut resize = operation("resize"); resize.width = Some(320); resize.height = Some(180); resize.fit = Some("contain".into());
-        process_video(&input, &output, "mp4", &[resize, operation("removeAudio")], &AtomicBool::new(false)).unwrap();
+        let recipe = vec![resize, operation("removeAudio")];
+        let preview = render_preview(input.to_string_lossy().into_owned(), recipe.clone()).unwrap();
+        assert!(preview.bytes.starts_with(&[0xff, 0xd8, 0xff]));
+        let mut progress = Vec::new();
+        process_video(&input, &output, "mp4", Some(0.25), &recipe, &AtomicBool::new(false), |value| progress.push(value)).unwrap();
+        assert_eq!(progress.last(), Some(&1.0));
         let probe = Command::new("ffprobe").args(["-v", "error", "-show_entries", "stream=codec_type,width,height", "-of", "json", output.to_string_lossy().as_ref()]).output().unwrap();
         let json: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
         let streams = json["streams"].as_array().unwrap();
         assert!(streams.iter().all(|stream| stream["codec_type"] != "audio"));
         assert_eq!(streams[0]["width"], 320); assert_eq!(streams[0]["height"], 180);
         fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn rejects_unbounded_or_unknown_recipes() {
+        let mut resize = operation("resize"); resize.width = Some(20_000); resize.height = Some(100); resize.fit = Some("contain".into());
+        assert!(validate_operations(&[resize]).unwrap_err().contains("16,384"));
+        assert!(validate_operations(&[operation("shell")]).unwrap_err().contains("Unsupported"));
     }
 }

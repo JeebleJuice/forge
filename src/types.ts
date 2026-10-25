@@ -36,6 +36,6 @@ export interface Preset { id: string; name: string; description: string; operati
 export interface HistoryEntry { id: string; startedAt: string; finishedAt: string; status: JobStatus; inputCount: number; outputCount: number; bytesBefore: number; bytesAfter: number; outputDir: string; errors: string[]; }
 export interface PersistedState { presets: Preset[]; history: HistoryEntry[]; outputDir?: string; }
 export interface ToolStatus { ffmpeg: boolean; ffprobe: boolean; imagemagick: boolean; }
-export interface JobProgress { jobId: string; index: number; total: number; path: string; status: JobStatus; outputPath?: string; outputSize?: number; error?: string; }
+export interface JobProgress { jobId: string; index: number; total: number; path: string; status: JobStatus; fileProgress?: number; outputPath?: string; outputSize?: number; error?: string; }
 export interface ProcessRequest { jobId: string; files: MediaFile[]; operations: Operation[]; outputDir: string; }
 export interface ProcessSummary { completed: number; failed: number; }

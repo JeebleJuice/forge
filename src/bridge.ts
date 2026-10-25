@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { BUILTIN_PRESETS } from "./presets";
-import type { JobProgress, MediaFile, PersistedState, ProcessRequest, ProcessSummary, ToolStatus } from "./types";
+import type { JobProgress, MediaFile, PersistedState, Preset, ProcessRequest, ProcessSummary, ToolStatus } from "./types";
 
 export const isNative = () => "__TAURI_INTERNALS__" in window;
 
@@ -75,6 +75,28 @@ export async function onFileDrop(handler: (paths: string[]) => void): Promise<Un
 export async function readPreview(path: string): Promise<{ bytes: number[]; mime: string } | null> {
   if (!isNative() || path.startsWith("/demo/")) return null;
   return invoke("read_preview", { path });
+}
+
+export async function renderPreview(path: string, operations: ProcessRequest["operations"]): Promise<{ bytes: number[]; mime: string } | null> {
+  if (!isNative() || path.startsWith("/demo/")) return null;
+  return invoke("render_preview", { path, operations });
+}
+
+export async function exportPreset(preset: Preset): Promise<boolean> {
+  if (isNative()) return invoke("export_preset", { preset });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(new Blob([JSON.stringify(preset, null, 2)], { type: "application/json" }));
+  link.download = `${preset.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "forge-preset"}.forge.json`;
+  link.click(); URL.revokeObjectURL(link.href); return true;
+}
+
+export async function importPreset(): Promise<Preset | null> {
+  if (isNative()) return invoke("import_preset");
+  return new Promise((resolve, reject) => {
+    const input = document.createElement("input"); input.type = "file"; input.accept = ".json,.forge.json";
+    input.onchange = async () => { try { resolve(input.files?.[0] ? JSON.parse(await input.files[0].text()) : null); } catch (error) { reject(error); } };
+    input.click();
+  });
 }
 
 export const defaultState: PersistedState = { presets: BUILTIN_PRESETS, history: [] };

@@ -18,9 +18,15 @@ FFmpeg/ffprobe handle MP4, MOV, MKV, WebM, AVI, and M4V input. Exports use H.264
 
 Actual codec availability depends on the system FFmpeg build. Forge reports per-file processor failures and preserves successful siblings in the batch.
 
+Video previews are real frames rendered from the active trim, resize, and rotation recipe. FFmpeg's structured progress stream drives within-file progress during encoding. Final video dimensions are rounded down by at most one pixel when necessary for codecs using 4:2:0 pixel formats.
+
+## Recipe portability and validation
+
+Recipes can contain at most 20 enabled operations. Dimensions, quality, trim ranges, rotations, output formats, and operation names are validated independently in the interface and native backend. Only one format decision is allowed. Imported preset files are limited to 1 MiB, parsed as structured JSON, and pass the same native validation before entering local state. Presets contain configuration only and cannot carry commands or executable paths.
+
 ## Estimates and history
 
-Output sizes shown before processing are estimates based on pixel-area and quality heuristics, and are labelled accordingly. Completed values come from the exported file. History stores counts, byte totals, timestamps, destinations, and error summaries—not file contents.
+Output sizes shown before processing are estimates based on pixel-area and quality heuristics, and are labelled accordingly. The visual “after” pane is separately rendered from the active recipe; it is not the original image with a label. Completed size values come from the exported file. History stores counts, byte totals, timestamps, destinations, and error summaries—not file contents.
 
 ## Limits
 
